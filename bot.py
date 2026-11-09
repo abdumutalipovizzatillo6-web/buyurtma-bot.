@@ -1,8 +1,9 @@
-"""Kichik sotuvchilar uchun buyurtma boti (aiogram 3 + SQLite).
-
-Sotuvchi botda do'kon ochadi, mahsulot qo'shadi va mijozlarga havola beradi.
-Mijoz havola orqali menyuni ko'radi, savatcha to'ldiradi va buyurtma beradi.
-Buyurtma sotuvchiga keladi, sotuvchi holatini tugmalar bilan o'zgartiradi.
+"""Kichik sotuvchilar uchun mukammallashtirilgan buyurtma boti (aiogram 3 + SQLite).
+Yangi funksiyalar:
+- Super Admin panel (Statistika va do'kon ochishni pullik/bepul qilish)
+- Kategoriyalar (Mahsulotlarni bo'limlarga ajratish)
+- Shikoyat va takliflar bo'limi
+- Buyurtmada yetkazib berish turi va vaqtini tanlash
 """
 import asyncio
 import html
@@ -10,6 +11,8 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -49,12 +52,11 @@ def load_env():
 
 load_env()
 
-# Hosting'da faqat /data papkasi saqlanib qoladi, shuning uchun baza o'sha yerga yoziladi
 _default_db = "/data/shop.db" if os.path.isdir("/data") else "shop.db"
 db = DB(os.environ.get("DB_PATH", _default_db))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 BOT_USERNAME = ""
-TZ = timezone(timedelta(hours=5))  # O'zbekiston vaqti
+TZ = timezone(timedelta(hours=5))
 
 router = Router()
 NOPREVIEW = LinkPreviewOptions(is_disabled=True)
@@ -81,8 +83,6 @@ BTN = {
 CANCEL = "❌ Bekor qilish"
 SKIP = "⏭ O'tkazib yuborish"
 
-
-# ======================= yordamchi =======================
 
 def esc(t) -> str:
     return html.escape(str(t if t is not None else ""))
@@ -127,11 +127,13 @@ def reply_kb(rows, one_time=False) -> ReplyKeyboardMarkup:
 
 
 def main_kb(uid: int) -> ReplyKeyboardMarkup:
-    rows = [["🍽 Menyu", "🛒 Savatcha"], ["📦 Buyurtmalarim"]]
+    rows = [["🍽 Menyu", "🛒 Savatcha"], ["📦 Buyurtmalarim", "💡 Shikoyat va takliflar"]]
     if db.get_shop_by_owner(uid):
         rows.append(["🏪 Mening do'konim", "ℹ️ Yordam"])
     else:
         rows.append(["🏬 Do'kon ochish", "ℹ️ Yordam"])
+    if ADMIN_ID and uid == ADMIN_ID:
+        rows.append(["⚙️ Super Admin Panel"])
     return reply_kb(rows)
 
 
@@ -151,10 +153,11 @@ async def safe_edit(msg: Message, text: str, kb=None):
 
 
 def order_text(o, items, for_seller: bool) -> str:
-    lines = [f"{i}. {esc(it['name'])} — {it['qty']} × {money(it['price'])}" for i, it in enumerate(items, 1)]
+    lines = [f"{i}. {esc(it['product_name'])} — {it['qty']} × {money(it['price'])}" for i, it in enumerate(items, 1)]
     head = f"📦 <b>Buyurtma #{o['id']}</b>\n"
     if for_seller:
         head += f"👤 {esc(o['customer_name'])}\n📞 {esc(o['phone'])}\n📍 {esc(o['address'])}\n"
+        head += f"🚚 Turi: {esc(o['delivery_type'])}\n⏰ Vaqt: {esc(o['delivery_time'])}\n"
     return (
         head
         + "\n"
@@ -219,6 +222,14 @@ def cart_view(uid: int):
 
 
 async def send_catalog(message: Message, shop):
+    categories = db.list_categories(shop["id"])
+    kb = InlineKeyboardBuilder()
+    if categories:
+        for c in categories:
+            kb.row(InlineKeyboardButton(text=f"📁 {c['name']}", callback_data=f"cat:{shop['id']}:{c['id']}"))
+        await message.answer(f"🏪 <b>{esc(shop['name'])}</b>\n\nBo'limni tanlang 👇", reply_markup=kb.as_markup())
+        return
+
     products = db.list_products(shop["id"], only_available=True)
     head = f"🏪 <b>{esc(shop['name'])}</b>"
     if shop["phone"]:
@@ -228,14 +239,14 @@ async def send_catalog(message: Message, shop):
         return
     await message.answer(head + "\n\nTanlang va «➕ Savatga» ni bosing 👇")
     for p in products[:30]:
-        text, kb = product_card_customer(p)
+        text, pkb = product_card_customer(p)
         if p["photo"]:
-            await message.answer_photo(photo=p["photo"], caption=text, reply_markup=kb)
+            await message.answer_photo(photo=p["photo"], caption=text, reply_markup=pkb)
         else:
-            await message.answer(text, reply_markup=kb)
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="🛒 Savatchani ochish", callback_data="cart"))
-    await message.answer("Tanlab bo'lgach savatchani oching:", reply_markup=kb.as_markup())
+            await message.answer(text, reply_markup=pkb)
+    c_kb = InlineKeyboardBuilder()
+    c_kb.row(InlineKeyboardButton(text="🛒 Savatchani ochish", callback_data="cart"))
+    await message.answer("Tanlab bo'lgach savatchani oching:", reply_markup=c_kb.as_markup())
 
 
 async def send_panel(message: Message, shop):
@@ -249,12 +260,13 @@ async def send_panel(message: Message, shop):
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="➕ Mahsulot qo'shish", callback_data="p_add"),
-        InlineKeyboardButton(text="📋 Mahsulotlar", callback_data="p_list"),
+        InlineKeyboardButton(text="📁 Kategoriya qo'shish", callback_data="c_add"),
     )
     kb.row(
+        InlineKeyboardButton(text="📋 Mahsulotlar", callback_data="p_list"),
         InlineKeyboardButton(text="📦 Faol buyurtmalar", callback_data="o_list"),
-        InlineKeyboardButton(text="✏️ Do'kon nomi", callback_data="s_name"),
     )
+    kb.row(InlineKeyboardButton(text="✏️ Do'kon nomi", callback_data="s_name"))
     await message.answer(text, reply_markup=kb.as_markup(), link_preview_options=NOPREVIEW)
 
 
@@ -268,14 +280,19 @@ def owned_product(uid: int, pid: int):
     return p
 
 
-# ======================= holatlar =======================
+# ======================= Holatlar =======================
 
 class Reg(StatesGroup):
     name = State()
     phone = State()
 
 
+class AddCategory(StatesGroup):
+    name = State()
+
+
 class AddP(StatesGroup):
+    category = State()
     name = State()
     price = State()
     photo = State()
@@ -290,11 +307,17 @@ class Rename(StatesGroup):
 
 
 class Order(StatesGroup):
+    delivery_type = State()
+    delivery_time = State()
     phone = State()
     address = State()
 
 
-# ======================= umumiy buyruqlar =======================
+class FeedbackState(StatesGroup):
+    msg = State()
+
+
+# ======================= Buyruqlar =======================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
@@ -325,15 +348,55 @@ async def cmd_id(message: Message):
     await message.answer(f"Sizning ID: <code>{message.from_user.id}</code>")
 
 
-@router.message(Command("stat"))
-async def cmd_stat(message: Message):
+# Super Admin Panel
+@router.message(F.text == "⚙️ Super Admin Panel")
+@router.message(Command("admin"))
+async def admin_panel(message: Message):
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
         return
     t = db.totals()
-    await message.answer(
-        f"📊 Foydalanuvchilar: {t['users']}\n🏪 Do'konlar: {t['shops']}\n"
-        f"🍽 Mahsulotlar: {t['products']}\n📦 Buyurtmalar: {t['orders']}\n💰 Aylanma: {money(t['sum'])}"
+    is_paid = db.get_setting("paid_shop", "0") == "1"
+    status_text = "🔴 Pullik" if is_paid else "🟢 Bepul"
+    
+    text = (
+        f"⚙️ <b>Super Admin Panel</b>\n\n"
+        f"📊 <b>Statistika:</b>\n"
+        f"👤 Foydalanuvchilar: {t['users']}\n"
+        f"🏪 Do'konlar: {t['shops']}\n"
+        f"🍽 Mahsulotlar: {t['products']}\n"
+        f"📦 Jami buyurtmalar: {t['orders']}\n"
+        f"💰 Jami aylanma: {money(t['sum'])}\n\n"
+        f"🏬 Do'kon ochish rejimi: <b>{status_text}</b>"
     )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔄 Do'kon ochish rejimini o'zgartirish", callback_data="toggle_paid_shop"))
+    await message.answer(text, reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "toggle_paid_shop")
+async def toggle_paid(cb: CallbackQuery):
+    if not ADMIN_ID or cb.from_user.id != ADMIN_ID:
+        await cb.answer()
+        return
+    curr = db.get_setting("paid_shop", "0")
+    new_val = "1" if curr == "0" else "0"
+    db.set_setting("paid_shop", new_val)
+    await cb.answer("Rejim o'zgartirildi!")
+    await admin_panel(cb.message)
+
+
+# Shikoyat va takliflar
+@router.message(F.text == "💡 Shikoyat va takliflar")
+async def feedback_start(message: Message, state: FSMContext):
+    await state.set_state(FeedbackState.msg)
+    await message.answer("O'z shikoyat yoki taklifingizni yozib yuboring. Biz buni albatta ko'rib chiqamiz!", reply_markup=cancel_kb())
+
+
+@router.message(FeedbackState.msg, F.text)
+async def feedback_save(message: Message, state: FSMContext):
+    db.add_feedback(message.from_user.id, message.from_user.full_name, message.text)
+    await state.clear()
+    await message.answer("Rahmat! Xabaringiz qabul qilindi. 🙏", reply_markup=main_kb(message.from_user.id))
 
 
 @router.message(F.text == CANCEL)
@@ -349,8 +412,8 @@ async def do_help(message: Message, state: FSMContext):
     await message.answer(
         "<b>Mijoz uchun:</b> sotuvchi bergan havolani oching → mahsulotni «➕ Savatga» → "
         "«🛒 Savatcha» → «✅ Buyurtma berish».\n\n"
-        "<b>Sotuvchi uchun:</b> «🏬 Do'kon ochish» → mahsulotlarni qo'shing → havolani mijozlarga yuboring "
-        "(Telegram, Instagram, kanal). Buyurtmalar shu yerga keladi, holatini tugmalar bilan o'zgartirasiz.",
+        "<b>Sotuvchi uchun:</b> «🏬 Do'kon ochish» → mahsulotlarni qo'shing → havolani mijozlarga yuboring. "
+        "Buyurtmalar shu yerga keladi.",
         reply_markup=main_kb(message.from_user.id),
     )
 
@@ -361,11 +424,27 @@ async def do_menu(message: Message, state: FSMContext):
     shop = db.get_user_shop(message.from_user.id)
     if not shop:
         await message.answer(
-            "Avval sotuvchining havolasini oching (u sizga yuborgan).",
+            "Avval sotuvchining havolasini oching.",
             reply_markup=main_kb(message.from_user.id),
         )
         return
     await send_catalog(message, shop)
+
+
+@router.callback_query(F.data.startswith("cat:"))
+async def view_category(cb: CallbackQuery):
+    _, shop_id, cat_id = cb.data.split(":")
+    products = db.list_products(int(shop_id), category_id=int(cat_id), only_available=True)
+    await cb.answer()
+    if not products:
+        await cb.message.answer("Bu bo'limda mahsulotlar yo'q.")
+        return
+    for p in products[:20]:
+        text, pkb = product_card_customer(p)
+        if p["photo"]:
+            await cb.message.answer_photo(photo=p["photo"], caption=text, reply_markup=pkb)
+        else:
+            await cb.message.answer(text, reply_markup=pkb)
 
 
 @router.message(F.text == "🛒 Savatcha")
@@ -391,7 +470,7 @@ async def do_my_orders(message: Message, state: FSMContext):
     await message.answer("📦 <b>So'nggi buyurtmalaringiz</b>\n\n" + "\n\n".join(lines))
 
 
-# ======================= sotuvchi: ro'yxatdan o'tish =======================
+# ======================= Sotuvchi: Do'kon va Kategoriyalar =======================
 
 @router.message(F.text == "🏬 Do'kon ochish")
 async def reg_start(message: Message, state: FSMContext):
@@ -400,6 +479,12 @@ async def reg_start(message: Message, state: FSMContext):
     if shop:
         await send_panel(message, shop)
         return
+
+    is_paid = db.get_setting("paid_shop", "0") == "1"
+    if is_paid:
+        await message.answer("⚠️ Hozirda do'kon ochish pullik rejimda. Iltimos, admin bilan bog'laning.")
+        return
+
     await state.set_state(Reg.name)
     await message.answer(
         "🏬 Do'kon ochamiz!\n\nDo'koningiz nomi nima? (masalan: «Nargiza opa noni»)",
@@ -440,15 +525,11 @@ async def reg_phone(message: Message, state: FSMContext):
     shop = db.create_shop(uid, data["name"], phone)
     db.set_user_shop(uid, shop["id"])
     await state.clear()
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="➕ Birinchi mahsulotni qo'shish", callback_data="p_add"))
     await message.answer(
-        f"🎉 Do'koningiz ochildi!\n\n🔗 Mijozlar uchun havola:\n{shop_link(shop)}\n\n"
-        "Uni Telegram, Instagram yoki kanalingizga joylang. Avval mahsulotlarni qo'shing 👇",
+        f"🎉 Do'koningiz ochildi!\n\n🔗 Mijozlar uchun havola:\n{shop_link(shop)}",
         reply_markup=main_kb(uid),
         link_preview_options=NOPREVIEW,
     )
-    await message.answer("Boshlaymiz:", reply_markup=kb.as_markup())
 
 
 @router.message(F.text == "🏪 Mening do'konim")
@@ -462,13 +543,49 @@ async def my_shop(message: Message, state: FSMContext):
     await send_panel(message, shop)
 
 
-# ======================= sotuvchi: mahsulotlar =======================
+# Kategoriya qo'shish
+@router.callback_query(F.data == "c_add")
+async def c_add(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddCategory.name)
+    await cb.message.answer("Yangi kategoriya (bo'lim) nomini kiriting:\n(masalan: <i>Fast Food</i>)", reply_markup=cancel_kb())
+    await cb.answer()
 
+
+@router.message(AddCategory.name, F.text)
+async def c_save(message: Message, state: FSMContext):
+    shop = db.get_shop_by_owner(message.from_user.id)
+    if shop:
+        db.add_category(shop["id"], message.text.strip())
+        await message.answer(f"✅ «{message.text.strip()}» kategoriyasi qo'shildi.", reply_markup=main_kb(message.from_user.id))
+    await state.clear()
+
+
+# Mahsulot qo'shish
 @router.callback_query(F.data == "p_add")
 async def p_add(cb: CallbackQuery, state: FSMContext):
-    if not db.get_shop_by_owner(cb.from_user.id):
+    shop = db.get_shop_by_owner(cb.from_user.id)
+    if not shop:
         await cb.answer("Avval do'kon oching", show_alert=True)
         return
+    
+    categories = db.list_categories(shop["id"])
+    if categories:
+        kb = InlineKeyboardBuilder()
+        for c in categories:
+            kb.row(InlineKeyboardButton(text=c["name"], callback_data=f"sel_cat:{c['id']}"))
+        kb.row(InlineKeyboardButton(text="🚫 Kategoriya siz", callback_data="sel_cat:0"))
+        await cb.message.answer("Mahsulot qaysi kategoriyaga tegishli?", reply_markup=kb.as_markup())
+    else:
+        await state.update_data(cat_id=None)
+        await state.set_state(AddP.name)
+        await cb.message.answer("Mahsulot nomi? (masalan: «Patir»)", reply_markup=cancel_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("sel_cat:"))
+async def p_sel_cat(cb: CallbackQuery, state: FSMContext):
+    cat_id = int(cb.data.split(":")[1])
+    await state.update_data(cat_id=cat_id if cat_id > 0 else None)
     await state.set_state(AddP.name)
     await cb.message.answer("Mahsulot nomi? (masalan: «Patir»)", reply_markup=cancel_kb())
     await cb.answer()
@@ -477,12 +594,9 @@ async def p_add(cb: CallbackQuery, state: FSMContext):
 @router.message(AddP.name, F.text)
 async def addp_name(message: Message, state: FSMContext):
     name = message.text.strip()
-    if not 1 <= len(name) <= 80:
-        await message.answer("Nom 1 dan 80 gacha belgi bo'lsin:")
-        return
     await state.update_data(name=name)
     await state.set_state(AddP.price)
-    await message.answer("💰 Narxi necha so'm? (faqat raqam, masalan: 5000)")
+    await message.answer("💰 Narxi necha so'm? (masalan: 5000)")
 
 
 @router.message(AddP.price, F.text)
@@ -494,7 +608,7 @@ async def addp_price(message: Message, state: FSMContext):
     await state.update_data(price=price)
     await state.set_state(AddP.photo)
     await message.answer(
-        "📷 Mahsulot rasmini yuboring (rasm bo'lsa ko'proq sotiladi) yoki o'tkazib yuboring:",
+        "📷 Mahsulot rasmini yuboring yoki o'tkazib yuboring:",
         reply_markup=reply_kb([[SKIP], [CANCEL]]),
     )
 
@@ -505,17 +619,11 @@ async def finish_add(message: Message, state: FSMContext, photo):
     await state.clear()
     if not shop:
         return
-    db.add_product(shop["id"], data["name"], data["price"], photo)
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="➕ Yana qo'shish", callback_data="p_add"),
-        InlineKeyboardButton(text="📋 Mahsulotlar", callback_data="p_list"),
-    )
+    db.add_product(shop["id"], data["name"], data["price"], photo, data.get("cat_id"))
     await message.answer(
         f"✅ «{esc(data['name'])}» — {money(data['price'])} qo'shildi.",
         reply_markup=main_kb(message.from_user.id),
     )
-    await message.answer("Davom etamizmi?", reply_markup=kb.as_markup())
 
 
 @router.message(AddP.photo, F.photo)
@@ -528,243 +636,7 @@ async def addp_skip(message: Message, state: FSMContext):
     await finish_add(message, state, None)
 
 
-@router.message(AddP.photo)
-async def addp_photo_bad(message: Message):
-    await message.answer("Rasm yuboring yoki «⏭ O'tkazib yuborish» ni bosing.")
-
-
-@router.callback_query(F.data == "p_list")
-async def p_list(cb: CallbackQuery):
-    shop = db.get_shop_by_owner(cb.from_user.id)
-    if not shop:
-        await cb.answer()
-        return
-    products = db.list_products(shop["id"])
-    await cb.answer()
-    if not products:
-        await cb.message.answer("Hali mahsulot yo'q. «➕ Mahsulot qo'shish» ni bosing (/panel).")
-        return
-    for p in products[:20]:
-        text, kb = product_card_seller(p)
-        if p["photo"]:
-            await cb.message.answer_photo(photo=p["photo"], caption=text, reply_markup=kb)
-        else:
-            await cb.message.answer(text, reply_markup=kb)
-    if len(products) > 20:
-        await cb.message.answer(f"Faqat dastlabki 20 tasi ko'rsatildi (jami {len(products)} ta).")
-
-
-@router.callback_query(F.data.startswith("pt:"))
-async def p_toggle(cb: CallbackQuery):
-    p = owned_product(cb.from_user.id, int(cb.data.split(":")[1]))
-    if not p:
-        await cb.answer("Topilmadi", show_alert=True)
-        return
-    db.set_available(p["id"], not p["available"])
-    p = db.get_product(p["id"])
-    text, kb = product_card_seller(p)
-    await safe_edit(cb.message, text, kb)
-    await cb.answer("Yangilandi")
-
-
-@router.callback_query(F.data.startswith("pp:"))
-async def p_price(cb: CallbackQuery, state: FSMContext):
-    p = owned_product(cb.from_user.id, int(cb.data.split(":")[1]))
-    if not p:
-        await cb.answer("Topilmadi", show_alert=True)
-        return
-    await state.set_state(EditPrice.price)
-    await state.update_data(pid=p["id"])
-    await cb.message.answer(
-        f"«{esc(p['name'])}» uchun yangi narx (so'm):", reply_markup=cancel_kb()
-    )
-    await cb.answer()
-
-
-@router.message(EditPrice.price, F.text)
-async def p_price_set(message: Message, state: FSMContext):
-    price = parse_price(message.text)
-    if price is None:
-        await message.answer("Narxni raqam bilan yozing, masalan: 5000")
-        return
-    data = await state.get_data()
-    p = owned_product(message.from_user.id, data.get("pid", 0))
-    await state.clear()
-    if not p:
-        await message.answer("Mahsulot topilmadi.", reply_markup=main_kb(message.from_user.id))
-        return
-    db.set_price(p["id"], price)
-    await message.answer(
-        f"✅ Yangi narx: {money(price)}. «📋 Mahsulotlar» (/panel) da ko'rasiz.",
-        reply_markup=main_kb(message.from_user.id),
-    )
-
-
-@router.callback_query(F.data.startswith("pd:"))
-async def p_delete_ask(cb: CallbackQuery):
-    p = owned_product(cb.from_user.id, int(cb.data.split(":")[1]))
-    if not p:
-        await cb.answer("Topilmadi", show_alert=True)
-        return
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="🗑 Ha, o'chirish", callback_data=f"py:{p['id']}"),
-        InlineKeyboardButton(text="↩️ Yo'q", callback_data=f"pn:{p['id']}"),
-    )
-    await safe_edit(cb.message, f"«{esc(p['name'])}» o'chirilsinmi?", kb.as_markup())
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("py:"))
-async def p_delete_yes(cb: CallbackQuery):
-    p = owned_product(cb.from_user.id, int(cb.data.split(":")[1]))
-    if not p:
-        await cb.answer("Topilmadi", show_alert=True)
-        return
-    db.delete_product(p["id"])
-    await safe_edit(cb.message, f"🗑 «{esc(p['name'])}» o'chirildi.", None)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("pn:"))
-async def p_delete_no(cb: CallbackQuery):
-    p = owned_product(cb.from_user.id, int(cb.data.split(":")[1]))
-    if not p:
-        await cb.answer()
-        return
-    text, kb = product_card_seller(p)
-    await safe_edit(cb.message, text, kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "s_name")
-async def s_name(cb: CallbackQuery, state: FSMContext):
-    if not db.get_shop_by_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    await state.set_state(Rename.name)
-    await cb.message.answer("Do'konning yangi nomi:", reply_markup=cancel_kb())
-    await cb.answer()
-
-
-@router.message(Rename.name, F.text)
-async def s_name_set(message: Message, state: FSMContext):
-    name = message.text.strip()
-    if not 2 <= len(name) <= 60:
-        await message.answer("Nom 2 dan 60 gacha belgi bo'lsin:")
-        return
-    shop = db.get_shop_by_owner(message.from_user.id)
-    await state.clear()
-    if shop:
-        db.rename_shop(shop["id"], name)
-    await message.answer("✅ Nom o'zgartirildi.", reply_markup=main_kb(message.from_user.id))
-
-
-# ======================= sotuvchi: buyurtmalar =======================
-
-@router.callback_query(F.data == "o_list")
-async def o_list(cb: CallbackQuery):
-    shop = db.get_shop_by_owner(cb.from_user.id)
-    await cb.answer()
-    if not shop:
-        return
-    orders = db.active_orders(shop["id"])
-    if not orders:
-        await cb.message.answer("Faol buyurtma yo'q 👌")
-        return
-    for o in reversed(orders):
-        await cb.message.answer(
-            order_text(o, db.order_items(o["id"]), True), reply_markup=status_kb(o)
-        )
-
-
-@router.callback_query(F.data.startswith("st:"))
-async def order_status(cb: CallbackQuery):
-    _, oid, new = cb.data.split(":")
-    o = db.get_order(int(oid))
-    if not o:
-        await cb.answer("Topilmadi", show_alert=True)
-        return
-    shop = db.get_shop(o["shop_id"])
-    if not shop or shop["owner_id"] != cb.from_user.id:
-        await cb.answer("Bu sizning buyurtmangiz emas", show_alert=True)
-        return
-    if new not in NEXT.get(o["status"], []):
-        await cb.answer("Bu holat allaqachon o'zgargan", show_alert=True)
-        o = db.get_order(o["id"])
-        await safe_edit(cb.message, order_text(o, db.order_items(o["id"]), True), status_kb(o))
-        return
-    db.set_status(o["id"], new)
-    o = db.get_order(o["id"])
-    await safe_edit(cb.message, order_text(o, db.order_items(o["id"]), True), status_kb(o))
-    await cb.answer(STATUS[new])
-
-    notes = {
-        "accepted": f"✅ Buyurtmangiz #{o['id']} qabul qilindi. Tayyorlanmoqda.",
-        "ready": f"🍽 Buyurtmangiz #{o['id']} tayyor!",
-        "delivered": f"🚚 Buyurtmangiz #{o['id']} yetkazildi. Xaridingiz uchun rahmat! 🙏",
-        "canceled": f"❌ Buyurtma #{o['id']} bekor qilindi. Savol bo'lsa: {shop['phone']}",
-    }
-    try:
-        await cb.bot.send_message(o["customer_id"], f"🏪 {esc(shop['name'])}\n{notes[new]}")
-    except Exception as e:  # mijoz botni to'xtatgan bo'lishi mumkin
-        log.warning("mijozga xabar bormadi: %s", e)
-
-
-# ======================= mijoz: savatcha =======================
-
-@router.callback_query(F.data == "noop")
-async def noop(cb: CallbackQuery):
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("add:"))
-async def cart_add(cb: CallbackQuery):
-    pid = int(cb.data.split(":")[1])
-    p = db.get_product(pid)
-    if not p or not p["available"]:
-        await cb.answer("Bu mahsulot hozir yo'q", show_alert=True)
-        return
-    db.upsert_user(cb.from_user.id, cb.from_user.full_name)
-    qty, cleared = db.cart_add(cb.from_user.id, pid)
-    msg = f"✅ Savatda: {qty} ta"
-    if cleared:
-        msg += "\n(boshqa do'kon mahsulotlari savatdan olib tashlandi)"
-    await cb.answer(msg, show_alert=cleared)
-
-
-@router.callback_query(F.data == "cart")
-async def cart_open(cb: CallbackQuery):
-    text, kb = cart_view(cb.from_user.id)
-    await cb.message.answer(text, reply_markup=kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("inc:"))
-async def cart_inc(cb: CallbackQuery):
-    db.cart_change(cb.from_user.id, int(cb.data.split(":")[1]), +1)
-    text, kb = cart_view(cb.from_user.id)
-    await safe_edit(cb.message, text, kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("dec:"))
-async def cart_dec(cb: CallbackQuery):
-    db.cart_change(cb.from_user.id, int(cb.data.split(":")[1]), -1)
-    text, kb = cart_view(cb.from_user.id)
-    await safe_edit(cb.message, text, kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "clear")
-async def cart_clear(cb: CallbackQuery):
-    db.cart_clear(cb.from_user.id)
-    text, kb = cart_view(cb.from_user.id)
-    await safe_edit(cb.message, text, kb)
-    await cb.answer("Savatcha tozalandi")
-
-
-# ======================= mijoz: buyurtma berish =======================
+# ======================= Buyurtma Jarayoni (Vaqt va Yetkazish turi bilan) =======================
 
 @router.callback_query(F.data == "checkout")
 async def checkout(cb: CallbackQuery, state: FSMContext):
@@ -772,9 +644,44 @@ async def checkout(cb: CallbackQuery, state: FSMContext):
     if not items:
         await cb.answer("Savatchada mavjud mahsulot yo'q", show_alert=True)
         return
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚚 Yetkazib berish"), KeyboardButton(text="🏃 Olib ketish (Samovivoz)")],
+            [KeyboardButton(text=CANCEL)]
+        ],
+        resize_keyboard=True
+    )
+    await state.set_state(Order.delivery_type)
+    await cb.message.answer("Buyurtma turini tanlang:", reply_markup=kb)
+    await cb.answer()
+
+
+@router.message(Order.delivery_type, F.text)
+async def order_del_type(message: Message, state: FSMContext):
+    if message.text not in ["🚚 Yetkazib berish", "🏃 Olib ketish (Samovivoz)"]:
+        await message.answer("Tugmalardan birini tanlang.")
+        return
+    await state.update_data(delivery_type=message.text)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⚡ Imkon qadar tezroq")],
+            [KeyboardButton(text="🕒 Bugun soat 18:00 ga"), KeyboardButton(text="🕒 Bugun soat 20:00 ga")],
+            [KeyboardButton(text=CANCEL)]
+        ],
+        resize_keyboard=True
+    )
+    await state.set_state(Order.delivery_time)
+    await message.answer("Qachonga yetkazilsin / tayyor bo'lsin?", reply_markup=kb)
+
+
+@router.message(Order.delivery_time, F.text)
+async def order_del_time(message: Message, state: FSMContext):
+    await state.update_data(delivery_time=message.text)
     await state.set_state(Order.phone)
-    await cb.message.answer(
-        "📱 Telefon raqamingizni yuboring (sotuvchi siz bilan bog'lanishi uchun):",
+    await message.answer(
+        "📱 Telefon raqamingizni yuboring:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="📱 Raqamimni yuborish", request_contact=True)],
@@ -783,7 +690,6 @@ async def checkout(cb: CallbackQuery, state: FSMContext):
             resize_keyboard=True,
         ),
     )
-    await cb.answer()
 
 
 @router.message(Order.phone, F.contact)
@@ -796,35 +702,31 @@ async def order_phone(message: Message, state: FSMContext):
         return
     await state.update_data(phone=phone)
     await state.set_state(Order.address)
-    await message.answer(
-        "📍 Manzilingiz va qachonga kerakligini yozing.\n"
-        "Masalan: «Navoiy ko'chasi 12-uy, ertaga soat 10:00»",
-        reply_markup=cancel_kb(),
-    )
+    await message.answer("📍 Manzilingizni yozib yuboring (yoki lokatsiya kiriting):", reply_markup=cancel_kb())
 
 
 @router.message(Order.address, F.text)
 async def order_address(message: Message, state: FSMContext):
-    address = message.text.strip()
-    if len(address) < 3:
-        await message.answer("Manzilni to'liqroq yozing:")
-        return
     data = await state.get_data()
     uid = message.from_user.id
-    oid = db.create_order(uid, message.from_user.full_name, data["phone"], address)
+    oid = db.create_order(
+        uid,
+        message.from_user.full_name,
+        data["phone"],
+        message.text.strip(),
+        data["delivery_type"],
+        data["delivery_time"]
+    )
     await state.clear()
     if oid is None:
-        await message.answer(
-            "Savatchangiz bo'sh yoki mahsulotlar tugagan.", reply_markup=main_kb(uid)
-        )
+        await message.answer("Savatchangiz bo'sh.", reply_markup=main_kb(uid))
         return
+    
     o = db.get_order(oid)
     shop = db.get_shop(o["shop_id"])
     items = db.order_items(oid)
     await message.answer(
-        f"✅ Buyurtmangiz #{oid} qabul qilindi!\n"
-        f"Sotuvchi tez orada siz bilan bog'lanadi: {esc(shop['phone'])}\n"
-        "Holati o'zgarganda shu yerga xabar keladi.",
+        f"✅ Buyurtmangiz #{oid} qabul qilindi!\nSotuvchi tez orada bog'lanadi: {esc(shop['phone'])}",
         reply_markup=main_kb(uid),
     )
     try:
@@ -834,21 +736,37 @@ async def order_address(message: Message, state: FSMContext):
             reply_markup=status_kb(o),
         )
     except Exception as e:
-        log.error("sotuvchiga xabar bormadi: %s", e)
-        await message.answer(
-            "⚠️ Sotuvchiga xabar yetkazib bo'lmadi. Iltimos, unga to'g'ridan-to'g'ri qo'ng'iroq qiling: "
-            + esc(shop["phone"])
-        )
+        log.error("Xabar bormadi: %s", e)
 
 
-# ======================= ishga tushirish =======================
+# ======================= Server funksiyasi =======================
+
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_server():
+    port = int(os.environ.get("PORT", 18012))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
 
 async def main():
     global BOT_USERNAME
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    token = (os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    
+    threading.Thread(target=run_server, daemon=True).start()
+
+    token = (os.environ.get("BOT_TOKEN") or "").strip()
     if not token:
-        raise SystemExit("Token topilmadi. BOT_TOKEN (yoki TELEGRAM_BOT_TOKEN) ni kiriting.")
+        raise SystemExit("Token topilmadi. Render'da BOT_TOKEN ni kiriting.")
+    
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
     BOT_USERNAME = me.username
